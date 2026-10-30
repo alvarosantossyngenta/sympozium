@@ -244,13 +244,18 @@ func TestBuildContainers_ToolOutputLimitCanBeOverridden(t *testing.T) {
 	cs, _, _ := (&AgentRunReconciler{}).buildContainers(run, false, nil, nil, nil, nil)
 
 	var got string
+	count := 0
 	for _, env := range cs[0].Env {
 		if env.Name == tooloutput.MaxBytesEnv {
 			got = env.Value
+			count++
 		}
 	}
 	if got != "32000" {
 		t.Fatalf("%s = %q, want 32000", tooloutput.MaxBytesEnv, got)
+	}
+	if count != 1 {
+		t.Fatalf("%s appears %d times, want exactly once", tooloutput.MaxBytesEnv, count)
 	}
 }
 
