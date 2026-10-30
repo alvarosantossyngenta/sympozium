@@ -4,10 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func TestBridgeDiscoverToolsWithPrefix(t *testing.T) {
@@ -457,6 +463,291 @@ func TestBridgeEndToEnd(t *testing.T) {
 	// Signal agent done to stop watcher
 	cancel()
 	<-errCh
+}
+
+func TestBridgeRunDispatchesRequestCreatedBeforeWatcherStarts(t *testing.T) {
+	var calls atomic.Int32
+	srv := mockMCPServer(t, []MCPTool{{Name: "ping", InputSchema: map[string]any{"type": "object"}}}, func(MCPToolCallParams) (*MCPToolCallResult, *JSONRPCError) {
+		calls.Add(1)
+		return &MCPToolCallResult{Content: []MCPContent{{Type: "text", Text: "pong"}}}, nil
+	})
+	defer srv.Close()
+
+	ipcDir := t.TempDir()
+	toolsDir := filepath.Join(ipcDir, "tools")
+	if err := os.MkdirAll(toolsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(toolsDir, "mcp-tools.json")
+	if err := WriteManifest(manifestPath, &MCPToolManifest{Tools: []MCPToolDef{{Name: "tst_ping"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := MCPRequest{ID: "before-watch", Tool: "tst_ping", Arguments: json.RawMessage(`{}`)}
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqPath := filepath.Join(toolsDir, "mcp-request-"+req.ID+".json")
+	if err := os.WriteFile(reqPath, reqData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &ServersConfig{Servers: []ServerConfig{{
+		Name: "test-srv", URL: srv.URL, ToolsPrefix: "tst", Timeout: 10, Transport: "streamable-http",
+	}}}
+	bridge := NewBridge(cfg, toolsDir, manifestPath, "startup-race")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- bridge.Run(ctx) }()
+
+	resultPath := filepath.Join(toolsDir, "mcp-result-"+req.ID+".json")
+	deadline := time.Now().Add(5 * time.Second)
+	var result MCPResult
+	for time.Now().Before(deadline) {
+		data, readErr := os.ReadFile(resultPath)
+		if readErr == nil && json.Unmarshal(data, &result) == nil {
+			break
+		}
+		select {
+		case runErr := <-errCh:
+			t.Fatalf("bridge exited before dispatching first request: %v", runErr)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if result.ID == "" {
+		t.Fatal("timed out waiting for the first MCP tool call")
+	}
+	if !result.Success {
+		t.Fatalf("first MCP tool call failed: %s", result.Error)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("MCP tool called %d times, want 1", got)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("bridge Run returned an error: %v", err)
+	}
+}
+
+func TestBridgeWatcherSetupFailurePreventsDiscovery(t *testing.T) {
+	ipcPath := filepath.Join(t.TempDir(), "tools")
+	if err := os.WriteFile(ipcPath, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var discoveryRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		discoveryRequests.Add(1)
+		var req JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if req.Method == "notifications/initialized" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		var result any
+		switch req.Method {
+		case "initialize":
+			result = MCPInitializeResult{ProtocolVersion: "2025-03-26", ServerInfo: MCPImplementation{Name: "test", Version: "1"}}
+		case "tools/list":
+			result = MCPToolsListResult{Tools: []MCPTool{}}
+		default:
+			http.Error(w, "unexpected method", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		resultData, err := json.Marshal(result)
+		if err != nil {
+			http.Error(w, "failed to marshal result", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(JSONRPCResponse{JSONRPC: "2.0", ID: &req.ID, Result: resultData})
+	}))
+	defer srv.Close()
+
+	cfg := &ServersConfig{Servers: []ServerConfig{{
+		Name: "test", URL: srv.URL, ToolsPrefix: "test", Timeout: 1, Transport: "streamable-http",
+	}}}
+	bridge := NewBridge(cfg, ipcPath, filepath.Join(ipcPath, "mcp-tools.json"), "watcher-order")
+
+	err := bridge.Run(context.Background())
+	if err == nil || !contains(err.Error(), "creating IPC directory") {
+		t.Fatalf("Run error = %v, want watcher setup failure before discovery", err)
+	}
+	if got := discoveryRequests.Load(); got != 0 {
+		t.Fatalf("MCP discovery made %d requests before watcher setup failed", got)
+	}
+}
+
+func TestBridgeReconcilesBeforeReadinessCallback(t *testing.T) {
+	var calls atomic.Int32
+	callStarted := make(chan struct{})
+	allowCall := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseCall := func() { releaseOnce.Do(func() { close(allowCall) }) }
+
+	srv := mockMCPServer(t, []MCPTool{{Name: "ping", InputSchema: map[string]any{"type": "object"}}}, func(MCPToolCallParams) (*MCPToolCallResult, *JSONRPCError) {
+		if calls.Add(1) == 1 {
+			close(callStarted)
+		}
+		<-allowCall
+		return &MCPToolCallResult{Content: []MCPContent{{Type: "text", Text: "pong"}}}, nil
+	})
+	defer srv.Close()
+	defer releaseCall()
+
+	ipcDir := t.TempDir()
+	manifestPath := filepath.Join(ipcDir, "mcp-tools.json")
+	cfg := &ServersConfig{Servers: []ServerConfig{{
+		Name: "test-srv", URL: srv.URL, ToolsPrefix: "tst", Timeout: 10, Transport: "streamable-http",
+	}}}
+	bridge := NewBridge(cfg, ipcDir, manifestPath, "reconcile-before-ready")
+	if _, err := bridge.discoverTools(context.Background()); err != nil {
+		t.Fatalf("discoverTools: %v", err)
+	}
+
+	req := MCPRequest{ID: "before-ready", Tool: "tst_ping", Arguments: json.RawMessage(`{}`)}
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqPath := filepath.Join(ipcDir, "mcp-request-"+req.ID+".json")
+	if err := os.WriteFile(reqPath, reqData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	watcher, err := bridge.newWatcher()
+	if err != nil {
+		t.Fatalf("newWatcher: %v", err)
+	}
+	defer watcher.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	onReady := func() error {
+		select {
+		case <-callStarted:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if _, ok := bridge.processed.Load(reqPath); !ok {
+			return fmt.Errorf("request was not reconciled before readiness publication")
+		}
+		releaseCall()
+		return WriteManifest(manifestPath, &MCPToolManifest{Tools: []MCPToolDef{{Name: "tst_ping"}}})
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- bridge.dispatchAndWatch(ctx, watcher, onReady) }()
+	resultPath := filepath.Join(ipcDir, "mcp-result-"+req.ID+".json")
+	deadline := time.Now().Add(3 * time.Second)
+	var result MCPResult
+	for time.Now().Before(deadline) {
+		data, readErr := os.ReadFile(resultPath)
+		if readErr == nil && json.Unmarshal(data, &result) == nil {
+			break
+		}
+		select {
+		case runErr := <-errCh:
+			t.Fatalf("dispatchAndWatch exited before completing request: %v", runErr)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if result.ID == "" {
+		t.Fatal("timed out waiting for reconciled MCP request")
+	}
+	if !result.Success {
+		t.Fatalf("reconciled MCP request failed: %s", result.Error)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("MCP tool called %d times, want 1", got)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("dispatchAndWatch returned an error: %v", err)
+	}
+}
+
+func TestBridgeReconcileAndWatcherEventDispatchRequestOnce(t *testing.T) {
+	var calls atomic.Int32
+	srv := mockMCPServer(t, []MCPTool{{Name: "ping", InputSchema: map[string]any{"type": "object"}}}, func(MCPToolCallParams) (*MCPToolCallResult, *JSONRPCError) {
+		calls.Add(1)
+		return &MCPToolCallResult{Content: []MCPContent{{Type: "text", Text: "pong"}}}, nil
+	})
+	defer srv.Close()
+
+	ipcDir := t.TempDir()
+	cfg := &ServersConfig{Servers: []ServerConfig{{
+		Name: "test-srv", URL: srv.URL, ToolsPrefix: "tst", Timeout: 10, Transport: "streamable-http",
+	}}}
+	bridge := NewBridge(cfg, ipcDir, filepath.Join(ipcDir, "mcp-tools.json"), "dedupe")
+	if _, err := bridge.discoverTools(context.Background()); err != nil {
+		t.Fatalf("discoverTools: %v", err)
+	}
+	watcher, err := bridge.newWatcher()
+	if err != nil {
+		t.Fatalf("newWatcher: %v", err)
+	}
+	defer watcher.Close()
+
+	req := MCPRequest{ID: "during-setup", Tool: "tst_ping", Arguments: json.RawMessage(`{}`)}
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqPath := filepath.Join(ipcDir, "mcp-request-"+req.ID+".json")
+	if err := os.WriteFile(reqPath, reqData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	if err := bridge.reconcileRequests(ctx, sem, &wg); err != nil {
+		t.Fatalf("reconcileRequests: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-watcher.Events:
+			if event.Name == reqPath && (event.Has(fsnotify.Create) || event.Has(fsnotify.Write)) {
+				bridge.dispatchRequest(ctx, event.Name, sem, &wg)
+				goto eventObserved
+			}
+		case err := <-watcher.Errors:
+			t.Fatalf("watcher error: %v", err)
+		case <-deadline:
+			t.Fatal("watcher did not report the setup request")
+		}
+	}
+
+eventObserved:
+	wg.Wait()
+	// A late duplicate event must not re-dispatch after the request was removed.
+	bridge.dispatchRequest(ctx, reqPath, sem, &wg)
+	wg.Wait()
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("MCP tool called %d times, want exactly 1", got)
+	}
+	resultData, err := os.ReadFile(filepath.Join(ipcDir, "mcp-result-"+req.ID+".json"))
+	if err != nil {
+		t.Fatalf("request result not written: %v", err)
+	}
+	var result MCPResult
+	if err := json.Unmarshal(resultData, &result); err != nil {
+		t.Fatalf("parse request result: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("request failed: %s", result.Error)
+	}
 }
 
 func TestDiscoverAndWriteManifest(t *testing.T) {

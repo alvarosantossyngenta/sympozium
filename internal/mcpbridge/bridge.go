@@ -40,7 +40,7 @@ type Bridge struct {
 	clients      map[string]*Client // server name -> client
 	toolIndex    map[string]string  // prefixed tool name -> server name
 	prefixIndex  map[string]string  // tools prefix -> server name
-	processed    sync.Map           // dedup fsnotify events
+	processed    sync.Map           // dedup filesystem events and startup reconciliation
 }
 
 // NewBridge creates a new MCP bridge.
@@ -61,12 +61,21 @@ func NewBridge(cfg *ServersConfig, ipcPath, manifestPath, agentRunID string) *Br
 	}
 }
 
-// Run starts the MCP bridge: discovers tools, writes manifest, then watches for requests.
+// Run starts watching before discovery so requests created while the manifest is
+// already available can be reconciled after the MCP clients are ready.
 func (b *Bridge) Run(ctx context.Context) error {
 	ctx, span := bridgeTracer.Start(ctx, "mcp-bridge.run",
 		trace.WithAttributes(attribute.String("agent_run_id", b.agentRunID)),
 	)
 	defer span.End()
+
+	watcher, err := b.newWatcher()
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "watcher setup failed")
+		return err
+	}
+	defer watcher.Close()
 
 	// Phase 1: Connect to MCP servers and discover tools
 	manifest, err := b.discoverTools(ctx)
@@ -78,46 +87,69 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 	span.SetAttributes(attribute.Int("mcp.tools_discovered", len(manifest.Tools)))
 
-	// Phase 2: Write tool manifest for agent-runner
-	if err := WriteManifest(b.manifestPath, manifest); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "manifest write failed")
-		return err
+	return b.dispatchAndWatch(ctx, watcher, func() error {
+		if err := WriteManifest(b.manifestPath, manifest); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "manifest write failed")
+			return err
+		}
+
+		log.Printf("Wrote tool manifest with %d tools to %s", len(manifest.Tools), b.manifestPath)
+		return nil
+	})
+}
+
+func (b *Bridge) newWatcher() (*fsnotify.Watcher, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, fmt.Errorf("creating fsnotify watcher: %w", err)
 	}
 
-	log.Printf("Wrote tool manifest with %d tools to %s", len(manifest.Tools), b.manifestPath)
+	if err := os.MkdirAll(b.ipcPath, 0o755); err != nil {
+		watcher.Close()
+		return nil, fmt.Errorf("creating IPC directory: %w", err)
+	}
 
-	// Phase 3: Watch for MCP requests and dispatch
-	return b.watchAndDispatch(ctx)
+	if err := watcher.Add(b.ipcPath); err != nil {
+		watcher.Close()
+		return nil, fmt.Errorf("watching IPC directory: %w", err)
+	}
+
+	// Also watch for agent completion (result.json in parent /ipc/output/).
+	outputDir := filepath.Join(filepath.Dir(b.ipcPath), "output")
+	_ = watcher.Add(outputDir) // best-effort; dir may not exist yet
+	return watcher, nil
 }
 
 // watchAndDispatch watches the IPC tools directory for MCP request files
 // and dispatches them to the appropriate MCP server.
 func (b *Bridge) watchAndDispatch(ctx context.Context) error {
-	watcher, err := fsnotify.NewWatcher()
+	watcher, err := b.newWatcher()
 	if err != nil {
-		return fmt.Errorf("creating fsnotify watcher: %w", err)
+		return err
 	}
 	defer watcher.Close()
+	return b.dispatchAndWatch(ctx, watcher, nil)
+}
 
-	if err := os.MkdirAll(b.ipcPath, 0o755); err != nil {
-		return fmt.Errorf("creating IPC directory: %w", err)
-	}
-
-	if err := watcher.Add(b.ipcPath); err != nil {
-		return fmt.Errorf("watching IPC directory: %w", err)
-	}
-
+func (b *Bridge) dispatchAndWatch(ctx context.Context, watcher *fsnotify.Watcher, onReady func() error) error {
 	log.Printf("Watching %s for MCP requests", b.ipcPath)
 
 	// Semaphore for concurrency control
 	sem := make(chan struct{}, maxConcurrent)
 
-	// Also watch for agent completion (result.json in parent /ipc/output/)
 	outputDir := filepath.Join(filepath.Dir(b.ipcPath), "output")
-	_ = watcher.Add(outputDir) // best-effort; dir may not exist yet
-
 	var wg sync.WaitGroup
+	if err := b.reconcileRequests(ctx, sem, &wg); err != nil {
+		wg.Wait()
+		return err
+	}
+	if onReady != nil {
+		if err := onReady(); err != nil {
+			wg.Wait()
+			return err
+		}
+	}
 
 	for {
 		select {
@@ -144,30 +176,11 @@ func (b *Bridge) watchAndDispatch(ctx context.Context) error {
 			if !event.Has(fsnotify.Create) && !event.Has(fsnotify.Write) {
 				continue
 			}
-			if !strings.HasPrefix(filename, "mcp-request-") || !strings.HasSuffix(filename, ".json") {
+			if !isMCPRequest(filename) {
 				continue
 			}
 
-			// Dedup: fsnotify fires both Create and Write
-			if _, loaded := b.processed.LoadOrStore(event.Name, true); loaded {
-				continue
-			}
-
-			// Acquire semaphore without blocking the event loop
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				wg.Wait()
-				return nil
-			}
-
-			wg.Add(1)
-			go func(path string) {
-				defer wg.Done()
-				defer func() { <-sem }() // release
-				b.handleRequest(ctx, path)
-				b.processed.Delete(path)
-			}(event.Name)
+			b.dispatchRequest(ctx, event.Name, sem, &wg)
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -177,6 +190,49 @@ func (b *Bridge) watchAndDispatch(ctx context.Context) error {
 			log.Printf("Watcher error: %v", err)
 		}
 	}
+}
+
+func (b *Bridge) reconcileRequests(ctx context.Context, sem chan struct{}, wg *sync.WaitGroup) error {
+	entries, err := os.ReadDir(b.ipcPath)
+	if err != nil {
+		return fmt.Errorf("reading IPC directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !isMCPRequest(entry.Name()) {
+			continue
+		}
+		b.dispatchRequest(ctx, filepath.Join(b.ipcPath, entry.Name()), sem, wg)
+	}
+	return nil
+}
+
+func (b *Bridge) dispatchRequest(ctx context.Context, path string, sem chan struct{}, wg *sync.WaitGroup) {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return
+	}
+	if _, loaded := b.processed.LoadOrStore(path, true); loaded {
+		return
+	}
+
+	select {
+	case sem <- struct{}{}:
+	case <-ctx.Done():
+		b.processed.Delete(path)
+		return
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() { <-sem }()
+		defer b.processed.Delete(path)
+		b.handleRequest(ctx, path)
+	}()
+}
+
+func isMCPRequest(filename string) bool {
+	return strings.HasPrefix(filename, "mcp-request-") && strings.HasSuffix(filename, ".json")
 }
 
 // extractIDFromFilename extracts the request ID from a filename like "mcp-request-<id>.json".
