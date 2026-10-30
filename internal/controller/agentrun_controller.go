@@ -53,6 +53,7 @@ import (
 	"github.com/sympozium-ai/sympozium/internal/orchestrator"
 	"github.com/sympozium-ai/sympozium/internal/pricing"
 	"github.com/sympozium-ai/sympozium/internal/sessionkey"
+	"github.com/sympozium-ai/sympozium/internal/tooloutput"
 	"github.com/sympozium-ai/sympozium/internal/toolpolicy"
 	"github.com/sympozium-ai/sympozium/pkg/sidecartools"
 	"gopkg.in/yaml.v3"
@@ -3283,6 +3284,7 @@ func (r *AgentRunReconciler) buildContainers(
 		{Name: "MODEL_NAME", Value: agentRun.Spec.Model.Model},
 		{Name: "MODEL_BASE_URL", Value: agentRun.Spec.Model.BaseURL},
 		{Name: "THINKING_MODE", Value: agentRun.Spec.Model.Thinking},
+		{Name: tooloutput.MaxBytesEnv, Value: strconv.Itoa(tooloutput.DefaultMaxBytes)},
 	}
 
 	// UseContext propagates the AgentRun-spec UseContext toggle (default true)
